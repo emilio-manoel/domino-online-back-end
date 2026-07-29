@@ -2,8 +2,14 @@ import express from "express";
 import http from "http";
 import cors from "cors";
 import { Server } from "socket.io";
-import { joinRoom, leaveRoom, findRoomBySocket } from "./rooms";
-import distributePieces, { createParts, CreateParts } from "./deviverParts";
+import {
+  joinRoom,
+  leaveRoom,
+  findRoomBySocket,
+  nextValidTurn,
+  getRoomsSnapshot,
+} from "./rooms";
+import distributePieces, { createParts } from "./deviverParts";
 
 const app = express();
 app.use(cors());
@@ -12,20 +18,33 @@ const httpServer = http.createServer(app);
 
 const io = new Server(httpServer, {
   cors: {
-    origin: "https://emilio-manoel.github.io/domino-online-front-end/", 
+    origin: "https://emilio-manoel.github.io/domino-online-front-end/",
     methods: ["GET", "POST"],
   },
+  // SEGURANÇA: Força desconexão de sockets zumbis após 20s sem ping
+  pingTimeout: 20000,
+  pingInterval: 10000,
 });
 
 app.get("/health", (_req, res) => {
-  res.json({ status: "ok" });
+  res.json({ status: "ok", rooms: getRoomsSnapshot() });
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
 io.on("connection", (socket) => {
-  console.log(`Jogador conectado: ${socket.id}`);
+  console.log(`[CONN] Jogador conectado: ${socket.id}`);
 
+  // ── join-room ──────────────────────────────────────────────────────────────
   socket.on("join-room", () => {
-    const { room, player } = joinRoom(socket);
+    const result = joinRoom(socket);
+
+    // SEGURANÇA: joinRoom retorna null se o socket já está em sala ou ela está cheia
+    if (!result) {
+      socket.emit("join-error", { message: "Não foi possível entrar na sala." });
+      return;
+    }
+
+    const { room, player } = result;
 
     socket.emit("player-assigned", {
       playerNumber: player.playerNumber,
@@ -45,50 +64,55 @@ io.on("connection", (socket) => {
         countdown: 3,
       });
 
-      setTimeout(() => {
+      // SEGURANÇA: Guarda o timer para poder cancelá-lo se alguém desconectar
+      room.gameStartTimer = setTimeout(() => {
+        room.gameStartTimer = null;
+
+        // SEGURANÇA: Re-verifica se a sala ainda tem 4 jogadores conectados
+        if (room.players.length < 4) {
+          console.warn(`[SEGURANÇA] Sala ${room.id} perdeu jogadores antes do início. Abortando.`);
+          room.status = "waiting";
+          io.to(room.id).emit("game-aborted", {
+            message: "Um jogador saiu antes do início. Aguardando novos jogadores…",
+          });
+          return;
+        }
+
         const parts = createParts();
         const hands = distributePieces(parts);
 
-        // Atribuir mãos aos jogadores e encontrar quem tem a 1-1
-        let startingPlayer = 1;
+        let startingPlayer = room.players[0].playerNumber;
         room.players.forEach((p, index) => {
           p.hand = hands[index];
-          
-          // Verifica se o jogador tem a peça 1-1
           const hasOneOne = p.hand.some(piece => piece.sideA === 1 && piece.sideB === 1);
-          if (hasOneOne) {
-            startingPlayer = p.playerNumber;
-          }
+          if (hasOneOne) startingPlayer = p.playerNumber;
         });
 
         room.currentTurn = startingPlayer;
         room.tableEnds = [];
         room.tablePieces = [];
         room.isPassing = false;
+        room.consecutivePasses = 0;
 
         io.to(room.id).emit("game-start", { roomId: room.id });
 
-        // Manda a mão para cada jogador e a mesa vazia
         room.players.forEach((p) => {
-          io.to(p.socketId).emit("your-hand", {
-            pieces: p.hand,
-          });
+          io.to(p.socketId).emit("your-hand", { pieces: p.hand });
         });
 
-        // Atualiza o turno para todos
         io.to(room.id).emit("turn-update", {
           currentTurn: room.currentTurn,
           tableEnds: room.tableEnds,
-          tablePieces: room.tablePieces
+          tablePieces: room.tablePieces,
         });
-
       }, 3000);
     }
   });
 
-  socket.on("play-piece", (data: { pieceId: string, sideToPlay?: number }) => {
+  // ── play-piece ─────────────────────────────────────────────────────────────
+  socket.on("play-piece", (data: { pieceId: string; sideToPlay?: number }) => {
     const room = findRoomBySocket(socket.id);
-    if (!room || room.isPassing) return;
+    if (!room || room.status !== "playing" || room.isPassing) return;
 
     const player = room.players.find(p => p.socketId === socket.id);
     if (!player || player.playerNumber !== room.currentTurn) return;
@@ -98,94 +122,97 @@ io.on("connection", (socket) => {
 
     const piece = player.hand[pieceIndex];
 
-    // Validação da jogada e atualização das pontas e peças visuais
+    // ── Validação e atualização da mesa ───────────────────────────────────────
     if (room.tableEnds.length === 0) {
       room.tableEnds = [piece.sideA, piece.sideB];
       room.tablePieces.push(piece);
     } else {
       let played = false;
+
       if (data.sideToPlay !== undefined) {
-        if (room.tableEnds[0] === data.sideToPlay && (piece.sideA === data.sideToPlay || piece.sideB === data.sideToPlay)) {
-          // Jogou na ponta esquerda
+        if (
+          room.tableEnds[0] === data.sideToPlay &&
+          (piece.sideA === data.sideToPlay || piece.sideB === data.sideToPlay)
+        ) {
           const otherSide = piece.sideA === data.sideToPlay ? piece.sideB : piece.sideA;
           room.tableEnds[0] = otherSide;
-          // Para visualmente ficar correto na esquerda: [otherSide, data.sideToPlay]
           room.tablePieces.unshift({ id: piece.id, sideA: otherSide, sideB: data.sideToPlay });
           played = true;
-        } else if (room.tableEnds[1] === data.sideToPlay && (piece.sideA === data.sideToPlay || piece.sideB === data.sideToPlay)) {
-          // Jogou na ponta direita
+        } else if (
+          room.tableEnds[1] === data.sideToPlay &&
+          (piece.sideA === data.sideToPlay || piece.sideB === data.sideToPlay)
+        ) {
           const otherSide = piece.sideA === data.sideToPlay ? piece.sideB : piece.sideA;
           room.tableEnds[1] = otherSide;
-          // Para visualmente ficar correto na direita: [data.sideToPlay, otherSide]
           room.tablePieces.push({ id: piece.id, sideA: data.sideToPlay, sideB: otherSide });
           played = true;
         }
-      } 
-      
-      // Se não jogou ainda (fallback ou fallback para lado não especificado)
+      }
+
       if (!played) {
         if (piece.sideA === room.tableEnds[1] || piece.sideB === room.tableEnds[1]) {
-           // Tenta na direita
-           const otherSide = piece.sideA === room.tableEnds[1] ? piece.sideB : piece.sideA;
-           room.tablePieces.push({ id: piece.id, sideA: room.tableEnds[1], sideB: otherSide });
-           room.tableEnds[1] = otherSide;
-           played = true;
+          const otherSide = piece.sideA === room.tableEnds[1] ? piece.sideB : piece.sideA;
+          room.tablePieces.push({ id: piece.id, sideA: room.tableEnds[1], sideB: otherSide });
+          room.tableEnds[1] = otherSide;
+          played = true;
         } else if (piece.sideA === room.tableEnds[0] || piece.sideB === room.tableEnds[0]) {
-           // Tenta na esquerda
-           const otherSide = piece.sideA === room.tableEnds[0] ? piece.sideB : piece.sideA;
-           room.tablePieces.unshift({ id: piece.id, sideA: otherSide, sideB: room.tableEnds[0] });
-           room.tableEnds[0] = otherSide;
-           played = true;
+          const otherSide = piece.sideA === room.tableEnds[0] ? piece.sideB : piece.sideA;
+          room.tablePieces.unshift({ id: piece.id, sideA: otherSide, sideB: room.tableEnds[0] });
+          room.tableEnds[0] = otherSide;
+          played = true;
         }
       }
 
-      if (!played) return; // Jogada inválida, a peça não combina com nenhuma ponta
+      if (!played) return;
     }
 
-    // Remove da mão
     player.hand.splice(pieceIndex, 1);
-    room.consecutivePasses = 0; // Zerou os passes pois houve uma jogada
+    room.consecutivePasses = 0;
 
     if (player.hand.length === 0) {
       io.to(room.id).emit("game-over", { winner: player.playerNumber });
-      room.status = "waiting"; // Reseta o status da sala
+      room.status = "waiting";
       return;
     }
 
-    // Passa a vez
-    if (room.currentTurn !== null) {
-      room.currentTurn = (room.currentTurn % 4) + 1;
-    }
+    // SEGURANÇA: Usa nextValidTurn para garantir que o próximo turno existe
+    room.currentTurn = nextValidTurn(room);
 
-    // Atualiza a mão do jogador atual
     socket.emit("your-hand", { pieces: player.hand });
 
-    // Envia o novo estado do turno
     io.to(room.id).emit("turn-update", {
       currentTurn: room.currentTurn,
       tableEnds: room.tableEnds,
-      tablePieces: room.tablePieces
+      tablePieces: room.tablePieces,
     });
   });
 
+  // ── pass-turn ──────────────────────────────────────────────────────────────
   socket.on("pass-turn", () => {
     const room = findRoomBySocket(socket.id);
-    if (!room || room.isPassing) return;
+    if (!room || room.status !== "playing" || room.isPassing) return;
 
     const player = room.players.find(p => p.socketId === socket.id);
     if (!player || player.playerNumber !== room.currentTurn) return;
 
     room.isPassing = true;
 
-    // Avisa que o jogador atual está passando a vez (para mostrar a classe .pass)
     io.to(room.id).emit("player-passed", {
-      playerNumber: player.playerNumber
+      playerNumber: player.playerNumber,
     });
 
-    // Espera 3 segundos antes de passar o turno real
-    setTimeout(() => {
+    // SEGURANÇA: Guarda o timer para poder cancelá-lo se alguém desconectar
+    room.passTimer = setTimeout(() => {
+      room.passTimer = null;
+
+      // SEGURANÇA: Re-verifica se a sala ainda está jogando
+      if (room.status !== "playing") {
+        room.isPassing = false;
+        return;
+      }
+
       room.consecutivePasses += 1;
-      
+
       if (room.consecutivePasses >= 4) {
         io.to(room.id).emit("game-over", { tie: true });
         room.status = "waiting";
@@ -193,28 +220,49 @@ io.on("connection", (socket) => {
         return;
       }
 
-      if (room.currentTurn !== null) {
-        room.currentTurn = (room.currentTurn % 4) + 1;
-      }
+      // SEGURANÇA: Usa nextValidTurn para turno circular com jogadores reais
+      room.currentTurn = nextValidTurn(room);
       room.isPassing = false;
 
       io.to(room.id).emit("turn-update", {
         currentTurn: room.currentTurn,
         tableEnds: room.tableEnds,
-        tablePieces: room.tablePieces
+        tablePieces: room.tablePieces,
       });
     }, 3000);
   });
 
-  socket.on("disconnect", () => {
-    const room = leaveRoom(socket);
-    if (room) {
-      io.to(room.id).emit("room-update", {
-        playersCount: room.players.length,
+  // ── disconnect ─────────────────────────────────────────────────────────────
+  socket.on("disconnect", (reason) => {
+    console.log(`[DISC] Jogador desconectado: ${socket.id} | Motivo: ${reason}`);
+
+    const room = findRoomBySocket(socket.id);
+    if (!room) return;
+
+    const leavingPlayer = room.players.find(p => p.socketId === socket.id);
+    const playerNumber = leavingPlayer?.playerNumber;
+    const wasPlaying = room.status === "playing";
+
+    const { room: updatedRoom } = leaveRoom(socket);
+
+    if (wasPlaying) {
+      // Partida interrompida: notifica quem ficou
+      if (updatedRoom) {
+        io.to(updatedRoom.id).emit("game-aborted", {
+          message: `Jogador ${playerNumber ?? "?"} abandonou. Aguardando novos jogadores…`,
+          disconnectedPlayer: playerNumber,
+        });
+        io.to(updatedRoom.id).emit("room-update", {
+          playersCount: updatedRoom.players.length,
+          maxPlayers: 4,
+        });
+      }
+    } else if (updatedRoom) {
+      io.to(updatedRoom.id).emit("room-update", {
+        playersCount: updatedRoom.players.length,
         maxPlayers: 4,
       });
     }
-    console.log(`Jogador desconectado: ${socket.id}`);
   });
 });
 
