@@ -8,11 +8,18 @@ import {
   findRoomBySocket,
   nextValidTurn,
   getRoomsSnapshot,
+  type Room,
 } from "./rooms";
 import distributePieces, { createParts } from "./deviverParts";
 
 const app = express();
 app.use(cors());
+
+const buildPlayerHandCounts = (room: Room) =>
+  room.players.reduce<Record<number, number>>(
+    (acc, p) => ({ ...acc, [p.playerNumber]: p.hand.length }),
+    {}
+  );
 
 const httpServer = http.createServer(app);
 
@@ -100,11 +107,15 @@ io.on("connection", (socket) => {
           io.to(p.socketId).emit("your-hand", { pieces: p.hand });
         });
 
+        const playerHandCounts = buildPlayerHandCounts(room);
+
         io.to(room.id).emit("turn-update", {
           currentTurn: room.currentTurn,
           tableEnds: room.tableEnds,
           tablePieces: room.tablePieces,
+          playerHandCounts,
         });
+        io.to(room.id).emit("player-hand-counts", { playerHandCounts });
       }, 3000);
     }
   });
@@ -180,11 +191,15 @@ io.on("connection", (socket) => {
 
     socket.emit("your-hand", { pieces: player.hand });
 
+    const playerHandCounts = buildPlayerHandCounts(room);
+
     io.to(room.id).emit("turn-update", {
       currentTurn: room.currentTurn,
       tableEnds: room.tableEnds,
       tablePieces: room.tablePieces,
+      playerHandCounts,
     });
+    io.to(room.id).emit("player-hand-counts", { playerHandCounts });
   });
 
   // ── pass-turn ──────────────────────────────────────────────────────────────
@@ -224,11 +239,15 @@ io.on("connection", (socket) => {
       room.currentTurn = nextValidTurn(room);
       room.isPassing = false;
 
+      const playerHandCounts = buildPlayerHandCounts(room);
+
       io.to(room.id).emit("turn-update", {
         currentTurn: room.currentTurn,
         tableEnds: room.tableEnds,
         tablePieces: room.tablePieces,
+        playerHandCounts,
       });
+      io.to(room.id).emit("player-hand-counts", { playerHandCounts });
     }, 3000);
   });
 
