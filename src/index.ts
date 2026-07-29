@@ -39,7 +39,7 @@ app.get("/health", (_req, res) => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 io.on("connection", (socket) => {
-  console.log(`[CONN] Jogador conectado: ${socket.id}`);
+  
 
   // ── join-room ──────────────────────────────────────────────────────────────
   socket.on("join-room", () => {
@@ -253,7 +253,7 @@ io.on("connection", (socket) => {
 
   // ── disconnect ─────────────────────────────────────────────────────────────
   socket.on("disconnect", (reason) => {
-    console.log(`[DISC] Jogador desconectado: ${socket.id} | Motivo: ${reason}`);
+    
 
     const room = findRoomBySocket(socket.id);
     if (!room) return;
@@ -287,5 +287,4 @@ io.on("connection", (socket) => {
 
 const PORT = process.env.PORT || 3001;
 httpServer.listen(PORT, () => {
-  console.log(`Servidor rodando em http://localhost:${PORT}`);
 });
